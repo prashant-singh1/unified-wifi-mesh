@@ -50,6 +50,7 @@
 #include "em_cmd.h"
 #include "em_cmd_exec.h"
 #include "util.h"
+#include "ec_ops.h"
 
 #ifdef AL_SAP
 #include "al_service_access_point.h"
@@ -807,11 +808,10 @@ then we can say that adding the CCE IE to all of the backhaul BSSs (according to
     return true;
 }
 
-bool em_t::bsta_connect_bss(const std::string& ssid, const std::string passphrase, bssid_t bssid)
+em_bss_info_t* em_t::get_bsta_bss_info()
 {
-    em_bss_info_t *bsta_info = NULL; 
     for (unsigned int i = 0; i < m_data_model->get_num_bss(); i++) {
-        bsta_info = m_data_model->get_bss_info(i);
+        em_bss_info_t *bsta_info = m_data_model->get_bss_info(i);
         if (!bsta_info) continue;
         // Skip if not backhaul
         if (bsta_info->id.haul_type != em_haul_type_backhaul) {
@@ -822,8 +822,14 @@ bool em_t::bsta_connect_bss(const std::string& ssid, const std::string passphras
         if (!radio->m_radio_info.enabled || !bsta_info->enabled) {
             continue;
         }
-        break;
+        return bsta_info;
     }
+    return NULL;
+}
+
+bool em_t::bsta_connect_bss(const std::string& ssid, const std::string passphrase, bssid_t bssid)
+{
+    em_bss_info_t *bsta_info = get_bsta_bss_info();
     if (!bsta_info) {
         em_printfout("No backhaul bSTA found to connect to BSS\n");
         return false;
@@ -846,17 +852,23 @@ bool em_t::bsta_connect_bss(const std::string& ssid, const std::string passphras
     return res == 1;
 }
 
-bool em_t::start_stop_build_ec_channel_list(bool do_start)
+bool em_t::trigger_sta_scan()
 {
-    if (do_start) {
-        // If we want to build the channel list, we have to be scanning,
-        // so we need to make sure we are not in the disconnected steady state
-        return m_mgr->set_disconnected_scan_none_state();
+    em_bss_info_t *bsta_info = get_bsta_bss_info();
+    if (!bsta_info) {
+        em_printfout("No backhaul bSTA found to start building channel list\n");
+        return false;
     }
-    // If we want to stop building the channel list (which only happens before action frames)
-    // we need to make sure we are in the disconnected steady state to make sure action frames are
-    // sent and recieved well.
-    return m_mgr->set_disconnected_steady_state();
+
+    em_scan_params_t scan_params;
+    memset(&scan_params, 0, sizeof(em_scan_params_t));
+    scan_params.num_op_classes = 0; // Will perform full scan
+    memcpy(scan_params.ruid, bsta_info->ruid.mac, sizeof(mac_address_t));
+    if (!m_mgr->send_scan_request(&scan_params, true, true)){
+        em_printfout("Failed to start scan for building channel list");
+        return false;
+    }
+    return true;
 }
 
 void em_t::push_to_queue(em_event_t *evt)
@@ -1334,23 +1346,48 @@ em_t::em_t(em_interface_t *ruid, em_freq_band_t band, dm_easy_mesh_t *dm, em_mgr
     // We'll only create the EC manager on the AL node 
     if (is_al_em){
         std::string mac_address = util::mac_to_string(get_al_interface_mac());
-        m_ec_manager = std::unique_ptr<ec_manager_t>(new ec_manager_t(
+
+        ec_ops_t ops;
+        // Shared callbacks
+        ops.send_chirp = std::bind(&em_t::send_chirp_notif_msg, this, std::placeholders::_1,
+                                    std::placeholders::_2);
+        ops.send_encap_dpp =
+            std::bind(&em_t::send_prox_encap_dpp_msg, this, std::placeholders::_1,
+                      std::placeholders::_2, std::placeholders::_3, std::placeholders::_4);
+        ops.send_dir_encap_dpp =
+            std::bind(&em_t::send_direct_encap_dpp_msg, this, std::placeholders::_1,
+                      std::placeholders::_2, std::placeholders::_3);
+        ops.send_act_frame   = std::bind(&em_mgr_t::send_action_frame, mgr, std::placeholders::_1,
+                                          std::placeholders::_2, std::placeholders::_3,
+                                          std::placeholders::_4, std::placeholders::_5);
+        ops.toggle_cce       = std::bind(&em_t::toggle_cce, this, std::placeholders::_1);
+        ops.trigger_sta_scan = std::bind(&em_t::trigger_sta_scan, this);
+        ops.bsta_connect     = std::bind(&em_t::bsta_connect_bss, this, std::placeholders::_1,
+                                          std::placeholders::_2, std::placeholders::_3);
+        ops.can_onboard_additional_aps = std::bind(&em_mgr_t::can_onboard_additional_aps, mgr);
+
+
+        // Enrollee callbacks
+        if (service_type == em_service_type_agent) {
+            ops.get_backhaul_sta_info =
+                std::bind(&em_t::create_enrollee_bsta_list, this, std::placeholders::_1);
+        }
+
+        // Controller Configurator callbacks
+        if (service_type == em_service_type_ctrl) {
+            ops.get_1905_info =
+                std::bind(&em_t::create_ieee1905_response_obj, this, std::placeholders::_1);
+            ops.get_fbss_info =
+                std::bind(&em_t::create_fbss_response_obj, this, std::placeholders::_1);
+            ops.get_backhaul_sta_info = std::bind(&em_t::create_configurator_bsta_response_obj,
+                                                   this, std::placeholders::_1);
+        }
+
+        m_ec_manager = std::make_unique<ec_manager_t>(
             mac_address,
-            std::bind(&em_t::send_chirp_notif_msg, this, std::placeholders::_1, std::placeholders::_2),
-            std::bind(&em_t::send_prox_encap_dpp_msg, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4),
-            std::bind(&em_mgr_t::send_action_frame, mgr, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5), 
-            service_type == em_service_type_agent
-                ? std::bind(&em_t::create_enrollee_bsta_list, this, std::placeholders::_1)
-                : std::bind(&em_t::create_configurator_bsta_response_obj, this, std::placeholders::_1),
+            ops,
             service_type == em_service_type_ctrl
-                ? std::bind(&em_t::create_ieee1905_response_obj, this, std::placeholders::_1)
-                : static_cast<get_1905_info_func>(nullptr),
-            std::bind(&em_mgr_t::can_onboard_additional_aps, mgr),
-            std::bind(&em_t::toggle_cce, this, std::placeholders::_1),
-            std::bind(&em_t::start_stop_build_ec_channel_list, this, std::placeholders::_1),
-            std::bind(&em_t::bsta_connect_bss, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3),
-            service_type == em_service_type_ctrl
-        ));
+        );
     }
 }
 
